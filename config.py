@@ -46,6 +46,10 @@ RSI_SELL_MAX = 52
 LOOKBACK_BARS = 12
 MIN_CANDLE_BODY_POINTS = 8
 
+# Do not scalp in an inactive market: the signal candle's tick volume must be
+# at least this multiple of the mean volume of the preceding LOOKBACK_BARS.
+MIN_TICK_VOLUME_RATIO = 1.10
+
 # Короткая пауза только после убытка (после профита не ждём)
 COOLDOWN_AFTER_LOSS_SEC = 15
 COOLDOWN_AFTER_WIN_SEC = 0
@@ -63,6 +67,8 @@ MAX_HOLD_BARS = 15
 # the bot's realised P/L for the broker day reaches this loss, it opens no new
 # positions until the next broker day.  Zero disables the breaker.
 MAX_DAILY_LOSS = 20.0
+MAX_TRADES_PER_DAY = 6
+MAX_CONSECUTIVE_LOSSES = 3
 
 # Учимся по последним закрытым сделкам бота
 LEARN_DEALS = 8

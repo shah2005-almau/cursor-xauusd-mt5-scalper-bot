@@ -171,6 +171,9 @@ class GoldBot:
         self.session_end_hour = int(config.SESSION_END_HOUR)
         self.max_hold_bars = int(config.MAX_HOLD_BARS)
         self.max_daily_loss = float(config.MAX_DAILY_LOSS)
+        self.max_trades_per_day = int(config.MAX_TRADES_PER_DAY)
+        self.max_consecutive_losses = int(config.MAX_CONSECUTIVE_LOSSES)
+        self.min_tick_volume_ratio = float(config.MIN_TICK_VOLUME_RATIO)
         self.min_body_points = int(config.MIN_CANDLE_BODY_POINTS)
         self.cooldown_loss_sec = int(config.COOLDOWN_AFTER_LOSS_SEC)
         self.cooldown_win_sec = int(config.COOLDOWN_AFTER_WIN_SEC)
@@ -408,8 +411,10 @@ class GoldBot:
         info = mt5.symbol_info(self.symbol)
         point = float(info.point) if info is not None else 0.01
         min_body = self.min_body_points * point
+        mean_tick_volume = float(prev["tick_volume"].mean())
+        volume_ratio = float(signal_bar["tick_volume"]) / mean_tick_volume if mean_tick_volume > 0.0 else 0.0
 
-        if body < min_body or adx < self.min_adx:
+        if body < min_body or adx < self.min_adx or volume_ratio < self.min_tick_volume_ratio:
             return None
 
         high_max = float(prev["high"].max())
@@ -478,6 +483,36 @@ class GoldBot:
             return True
         return False
 
+    def entry_risk_limit_hit(self) -> bool:
+        """Stop new entries after too many trades or consecutive losing exits today."""
+        now = datetime.now(UTC)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = mt5.history_deals_get(day_start, now)
+        if deals is None:
+            print("[RISK] Cannot read today's deal history; new entry blocked")
+            return True
+        closed = sorted(
+            (
+                d for d in deals
+                if d.magic == self.magic and d.symbol == self.symbol and d.entry == mt5.DEAL_ENTRY_OUT
+            ),
+            key=lambda d: d.time,
+        )
+        if self.max_trades_per_day > 0 and len(closed) >= self.max_trades_per_day:
+            print(f"[RISK] Daily trade limit reached: {len(closed)}/{self.max_trades_per_day}")
+            return True
+        if self.max_consecutive_losses > 0:
+            consecutive_losses = 0
+            for deal in reversed(closed):
+                net_profit = float(deal.profit) + float(deal.commission) + float(deal.swap)
+                if net_profit >= 0.0:
+                    break
+                consecutive_losses += 1
+            if consecutive_losses >= self.max_consecutive_losses:
+                print(f"[RISK] Consecutive-loss limit reached: {consecutive_losses}")
+                return True
+        return False
+
     def _closed_bar_time(self, df: pd.DataFrame) -> Optional[pd.Timestamp]:
         if df is None or len(df) < 2:
             return None
@@ -531,13 +566,8 @@ class GoldBot:
         return None
 
     def adaptive_sl_mult(self) -> float:
-        """После серии стопов чуть шире стоп; после профитов — к базовому значению."""
-        closed = self._closed_deals()[-self.learn_deals :]
-        if not closed:
-            return self.atr_sl_mult
-        losses = sum(1 for d in closed if d.profit < 0)
-        extra = 0.2 * losses
-        return min(self.atr_sl_mult + extra, 2.8)
+        """Keep a fixed ATR stop multiplier; losing streaks must not increase risk."""
+        return self.atr_sl_mult
 
     def in_cooldown(self) -> bool:
         """После профита почти сразу; после стопа — короткая пауза 15с."""
@@ -805,6 +835,10 @@ class GoldBot:
                         continue
 
                     if self.daily_loss_limit_hit():
+                        time.sleep(self.check_interval)
+                        continue
+
+                    if self.entry_risk_limit_hit():
                         time.sleep(self.check_interval)
                         continue
 
