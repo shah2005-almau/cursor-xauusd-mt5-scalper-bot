@@ -63,8 +63,73 @@ class GoldBot:
         self.deviation = int(config.DEVIATION)
         self._connected = False
 
+    def _gold_candidates(self) -> list[str]:
+        """Имена золота у разных брокеров (FxPro часто GOLD, не XAUUSD)."""
+        seen: set[str] = set()
+        names: list[str] = []
+        for name in (
+            self.symbol,
+            "XAUUSD",
+            "GOLD",
+            "XAUUSD.",
+            "XAUUSDm",
+            "XAUUSD.a",
+            "XAUUSDpro",
+            "GOLDm",
+            "GOLD.",
+        ):
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
+    def _list_gold_symbols(self) -> list[str]:
+        """Все символы терминала, похожие на золото."""
+        symbols = mt5.symbols_get()
+        if symbols is None:
+            return []
+        found: list[str] = []
+        for item in symbols:
+            upper = item.name.upper()
+            if "XAU" in upper or "GOLD" in upper:
+                found.append(item.name)
+        return found
+
+    def _resolve_symbol(self) -> Optional[str]:
+        """Выбрать торговый символ: config, типичные алиасы, поиск в терминале."""
+        for name in self._gold_candidates():
+            if mt5.symbol_select(name, True):
+                info = mt5.symbol_info(name)
+                if info is not None:
+                    if name != self.symbol:
+                        print(
+                            f"[OK] Символ {self.symbol!r} недоступен, "
+                            f"используем {name!r}. Пропишите его в config.py."
+                        )
+                    return name
+
+        gold = self._list_gold_symbols()
+        if gold:
+            print(f"[ИНФО] В терминале найдены символы золота: {', '.join(gold)}")
+            for name in gold:
+                if mt5.symbol_select(name, True) and mt5.symbol_info(name) is not None:
+                    print(f"[OK] Берём символ {name!r}. Запишите его в config.py как SYMBOL.")
+                    return name
+
+        err = mt5.last_error()
+        print(f"[ОШИБКА] Не удалось выбрать символ {self.symbol}: {err}")
+        if gold:
+            print("Укажите точное имя из списка выше в config.py → SYMBOL.")
+        else:
+            print(
+                "Python не достучался до списка символов (часто 'Terminal: Call failed'). "
+                "Оставьте открытым только один MT5, Python 64-bit как терминал, "
+                "перезапустите MT5 и снова python bot.py."
+            )
+        return None
+
     def connect(self) -> bool:
-        """Подключение к MT5, проверка терминала и наличие символа XAUUSD."""
+        """Подключение к MT5, проверка терминала и наличие символа золота."""
         if not mt5.initialize():
             print(
                 f"[ОШИБКА] Не удалось подключиться к MT5: {mt5.last_error()}. "
@@ -72,11 +137,16 @@ class GoldBot:
             )
             return False
 
+        # Даём IPC-каналу время подняться после initialize()
+        time.sleep(0.5)
+
         terminal = mt5.terminal_info()
         if terminal is None:
             print(f"[ОШИБКА] Терминал недоступен: {mt5.last_error()}")
             mt5.shutdown()
             return False
+
+        print(f"[ИНФО] Терминал: {terminal.name}, путь: {terminal.path}")
 
         if not terminal.connected:
             print("[ОШИБКА] Терминал запущен, но нет связи с торговым сервером.")
@@ -85,8 +155,9 @@ class GoldBot:
 
         if not terminal.trade_allowed:
             print(
-                "[ПРЕДУПРЕЖДЕНИЕ] Автоторговля в терминале выключена "
-                "(Сервис → Настройки → Советники → разрешить алготорговлю)."
+                "[ПРЕДУПРЕЖДЕНИЕ] Автоторговля выключена. "
+                "На панели MT5 нажмите кнопку «Algo Trading» / «Алготорг» "
+                "(должна стать активной). Галочки в Настройки → Советники недостаточно."
             )
 
         account = mt5.account_info()
@@ -103,14 +174,11 @@ class GoldBot:
             mt5.shutdown()
             return False
 
-        # Включаем символ в «Обзоре рынка», иначе котировки могут не приходить
-        if not mt5.symbol_select(self.symbol, True):
-            print(
-                f"[ОШИБКА] Символ {self.symbol} не найден или не выбран. "
-                f"{mt5.last_error()}"
-            )
+        resolved = self._resolve_symbol()
+        if resolved is None:
             mt5.shutdown()
             return False
+        self.symbol = resolved
 
         info = mt5.symbol_info(self.symbol)
         if info is None:
