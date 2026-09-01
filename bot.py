@@ -1,9 +1,8 @@
 """
 Скальпинг-бот XAUUSD для MetaTrader 5.
 
-Стратегия: пробой экстремума последних LOOKBACK_BARS свечей
-с фильтром по EMA. Перед запуском должен быть открыт терминал MT5
-и выполнен вход в торговый счёт.
+Стратегия: пробой закрытой свечи + EMA + ATR-стопы.
+Перед запуском должен быть открыт терминал MT5 и выполнен вход в счёт.
 """
 
 from __future__ import annotations
@@ -46,6 +45,27 @@ def calc_ema(closes: np.ndarray, period: int) -> np.ndarray:
     return ema
 
 
+def calc_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+    """Average True Range (ATR) — типичный диапазон свечи."""
+    n = close.size
+    atr = np.zeros(n, dtype=np.float64)
+    if n == 0:
+        return atr
+    tr = np.empty(n, dtype=np.float64)
+    tr[0] = float(high[0] - low[0])
+    for i in range(1, n):
+        tr[i] = max(
+            float(high[i] - low[i]),
+            abs(float(high[i] - close[i - 1])),
+            abs(float(low[i] - close[i - 1])),
+        )
+    atr[0] = tr[0]
+    alpha = 1.0 / period
+    for i in range(1, n):
+        atr[i] = alpha * tr[i] + (1.0 - alpha) * atr[i - 1]
+    return atr
+
+
 class GoldBot:
     """Торговый бот по золоту: подключение к MT5, сигналы и рыночные ордера."""
 
@@ -61,7 +81,15 @@ class GoldBot:
         self.magic = int(config.MAGIC_NUMBER)
         self.candles_count = int(config.CANDLES_COUNT)
         self.deviation = int(config.DEVIATION)
+        self.stops_buffer_points = int(config.STOPS_BUFFER_POINTS)
+        self.max_spread_points = int(config.MAX_SPREAD_POINTS)
+        self.atr_period = int(config.ATR_PERIOD)
+        self.atr_sl_mult = float(config.ATR_SL_MULT)
+        self.atr_tp_mult = float(config.ATR_TP_MULT)
+        self.min_body_points = int(config.MIN_CANDLE_BODY_POINTS)
+        self.cooldown_sec = int(config.COOLDOWN_AFTER_TRADE_SEC)
         self._connected = False
+        self._last_signal_bar: Optional[pd.Timestamp] = None
 
     def _gold_candidates(self) -> list[str]:
         """Имена золота у разных брокеров (FxPro часто GOLD, не XAUUSD)."""
@@ -193,9 +221,12 @@ class GoldBot:
                 return False
 
         self._connected = True
+        tick = mt5.symbol_info_tick(self.symbol)
+        spread = (float(tick.ask) - float(tick.bid)) if tick else 0.0
         print(
             f"[OK] Подключено к MT5. Счёт {account.login}, сервер {account.server}, "
-            f"символ {self.symbol}, point={info.point}, digits={info.digits}"
+            f"символ {self.symbol}, point={info.point}, digits={info.digits}, "
+            f"спред={spread:.{info.digits}f}, stops_level={info.trade_stops_level}"
         )
         return True
 
@@ -209,32 +240,98 @@ class GoldBot:
 
         df = pd.DataFrame(rates)
         df["time"] = pd.to_datetime(df["time"], unit="s")
-        df["ema"] = calc_ema(df["close"].to_numpy(dtype=np.float64), self.ema_period)
+        closes = df["close"].to_numpy(dtype=np.float64)
+        df["ema"] = calc_ema(closes, self.ema_period)
+        df["atr"] = calc_atr(
+            df["high"].to_numpy(dtype=np.float64),
+            df["low"].to_numpy(dtype=np.float64),
+            closes,
+            self.atr_period,
+        )
         return df
 
     def check_signal(self, df: pd.DataFrame) -> Optional[str]:
         """
-        BUY: close последней свечи выше max(high) предыдущих LOOKBACK свечей и выше EMA.
-        SELL: close последней свечи ниже min(low) предыдущих LOOKBACK свечей и ниже EMA.
-        Иначе None.
+        Сигнал только по ПОСЛЕДНЕЙ ЗАКРЫТОЙ свече (не по текущей формирующейся).
+        BUY: пробой максимума, закрытие выше EMA, EMA растёт, бычья свеча.
+        SELL: пробой минимума, закрытие ниже EMA, EMA падает, медвежья свеча.
         """
-        need = self.lookback + 1
+        # -1 — текущая незакрытая, -2 — последняя закрытая
+        need = self.lookback + self.atr_period + 3
         if df is None or len(df) < need:
             print(f"[ОШИБКА] Мало свечей для сигнала: нужно минимум {need}")
             return None
 
-        last = df.iloc[-1]
-        prev = df.iloc[-(self.lookback + 1) : -1]
-        close = float(last["close"])
-        ema_now = float(last["ema"])
+        signal_bar = df.iloc[-2]
+        prev = df.iloc[-(self.lookback + 2) : -2]
+        ema_now = float(signal_bar["ema"])
+        ema_prev = float(df.iloc[-3]["ema"])
+        close = float(signal_bar["close"])
+        open_ = float(signal_bar["open"])
+        body = abs(close - open_)
+        info = mt5.symbol_info(self.symbol)
+        point = float(info.point) if info is not None else 0.01
+        min_body = self.min_body_points * point
+
+        if body < min_body:
+            return None
+
         high_max = float(prev["high"].max())
         low_min = float(prev["low"].min())
+        ema_up = ema_now > ema_prev
+        ema_down = ema_now < ema_prev
 
-        if close > high_max and close > ema_now:
+        if close > high_max and close > ema_now and ema_up and close > open_:
             return "BUY"
-        if close < low_min and close < ema_now:
+        if close < low_min and close < ema_now and ema_down and close < open_:
             return "SELL"
         return None
+
+    def _closed_bar_time(self, df: pd.DataFrame) -> Optional[pd.Timestamp]:
+        if df is None or len(df) < 2:
+            return None
+        return df.iloc[-2]["time"]
+
+    def spread_too_wide(self, tick) -> bool:
+        """Не торговать при широком спреде — стоп почти сразу в рынке."""
+        info = mt5.symbol_info(self.symbol)
+        if tick is None or info is None:
+            return True
+        spread = abs(float(tick.ask) - float(tick.bid))
+        limit = self.max_spread_points * float(info.point)
+        if spread > limit:
+            print(
+                f"[ПРОПУСК] Спред {spread:.{info.digits}f} > лимита "
+                f"{limit:.{info.digits}f} ({self.max_spread_points} пунктов)"
+            )
+            return True
+        return False
+
+    def in_cooldown(self) -> bool:
+        """Пауза после закрытия позиции, чтобы не ловить серию стопов подряд."""
+        now = int(time.time())
+        deals = mt5.history_deals_get(now - 24 * 3600, now)
+        if deals is None:
+            return False
+        closed = [
+            d
+            for d in deals
+            if d.magic == self.magic
+            and d.symbol == self.symbol
+            and d.entry == mt5.DEAL_ENTRY_OUT
+        ]
+        if not closed:
+            return False
+        last = max(closed, key=lambda d: d.time)
+        elapsed = now - int(last.time)
+        if elapsed < self.cooldown_sec:
+            left = self.cooldown_sec - elapsed
+            print(
+                f"[ПРОПУСК] Пауза после сделки ({elapsed}с), осталось {left}с. "
+                f"profit={last.profit:.2f}"
+            )
+            return True
+        return False
 
     def _filling_type(self, symbol_info: mt5.SymbolInfo) -> int:
         """Режим исполнения, который поддерживает брокер для символа."""
@@ -265,6 +362,14 @@ class GoldBot:
             return False
         return any(pos.magic == self.magic for pos in positions)
 
+    def _min_stop_distance(self, info: mt5.SymbolInfo, tick: mt5.Tick) -> float:
+        """Минимальный отступ SL/TP: брокер + спред + запас (иначе 10016 Invalid stops)."""
+        point = float(info.point)
+        spread = abs(float(tick.ask) - float(tick.bid))
+        broker_min = max(int(info.trade_stops_level), int(info.trade_freeze_level)) * point
+        buffer = self.stops_buffer_points * point
+        return max(broker_min, spread + buffer, point)
+
     def open_order(self, direction: str, df: pd.DataFrame) -> bool:
         """Рыночный ордер BUY по ask / SELL по bid со SL и TP в пунктах."""
         tick = mt5.symbol_info_tick(self.symbol)
@@ -276,36 +381,33 @@ class GoldBot:
         point = float(info.point)
         digits = int(info.digits)
         volume = self._normalize_volume(info, self.lot)
+        min_dist = self._min_stop_distance(info, tick)
+        atr = float(df["atr"].iloc[-2]) if len(df) >= 2 else 0.0
+        sl_dist = max(self.sl_points * point, atr * self.atr_sl_mult, min_dist)
+        tp_dist = max(self.tp_points * point, atr * self.atr_tp_mult, sl_dist * 1.6)
+        print(
+            f"[УРОВНИ] ATR={atr:.{digits}f} sl_dist={sl_dist:.{digits}f} "
+            f"tp_dist={tp_dist:.{digits}f} (риск/прибыль ~ {tp_dist / sl_dist:.2f})"
+        )
+
+        bid = float(tick.bid)
+        ask = float(tick.ask)
 
         if direction == "BUY":
+            # Закрытие BUY по bid: SL ниже bid, TP выше ask
             order_type = mt5.ORDER_TYPE_BUY
-            price = float(tick.ask)
-            sl = price - self.sl_points * point
-            tp = price + self.tp_points * point
+            price = ask
+            sl = bid - sl_dist
+            tp = ask + tp_dist
         elif direction == "SELL":
+            # Закрытие SELL по ask: SL выше ask, TP ниже bid
             order_type = mt5.ORDER_TYPE_SELL
-            price = float(tick.bid)
-            sl = price + self.sl_points * point
-            tp = price - self.tp_points * point
+            price = bid
+            sl = ask + sl_dist
+            tp = bid - tp_dist
         else:
             print(f"[ОШИБКА] Неизвестное направление ордера: {direction}")
             return False
-
-        # Минимальная дистанция стопов у брокера
-        stops_level = int(info.trade_stops_level)
-        freeze_level = int(info.trade_freeze_level)
-        min_distance = max(stops_level, freeze_level) * point
-        if min_distance > 0:
-            if direction == "BUY":
-                if price - sl < min_distance:
-                    sl = price - min_distance
-                if tp - price < min_distance:
-                    tp = price + min_distance
-            else:
-                if sl - price < min_distance:
-                    sl = price + min_distance
-                if price - tp < min_distance:
-                    tp = price - min_distance
 
         sl = round(sl, digits)
         tp = round(tp, digits)
@@ -351,7 +453,8 @@ class GoldBot:
 
         print(
             f"[СТАРТ] Цикл {self.check_interval}с | {self.symbol} {self.timeframe_name} | "
-            f"lot={self.lot} SL={self.sl_points} TP={self.tp_points} EMA={self.ema_period}"
+            f"lot={self.lot} minSL={self.sl_points} minTP={self.tp_points} "
+            f"EMA={self.ema_period} ATR x{self.atr_sl_mult}/{self.atr_tp_mult}"
         )
         print("Остановка: Ctrl+C")
 
@@ -369,22 +472,40 @@ class GoldBot:
                         time.sleep(self.check_interval)
                         continue
 
+                    if self.in_cooldown():
+                        time.sleep(self.check_interval)
+                        continue
+
                     df = self.get_data()
                     if df is None:
                         time.sleep(self.check_interval)
                         continue
 
-                    signal = self.check_signal(df)
+                    bar_time = self._closed_bar_time(df)
                     tick = mt5.symbol_info_tick(self.symbol)
                     if tick is not None:
                         price_txt = f"bid={tick.bid} ask={tick.ask}"
                     else:
                         price_txt = f"close={float(df.iloc[-1]['close']):.5f}"
 
+                    signal = self.check_signal(df)
                     print(f"[{now}] {self.symbol} {price_txt} | сигнал={signal}")
 
-                    if signal in ("BUY", "SELL"):
-                        self.open_order(signal, df)
+                    if signal not in ("BUY", "SELL"):
+                        time.sleep(self.check_interval)
+                        continue
+
+                    if bar_time is not None and bar_time == self._last_signal_bar:
+                        print("[ПРОПУСК] По этой закрытой свече уже пытались входить")
+                        time.sleep(self.check_interval)
+                        continue
+
+                    if self.spread_too_wide(tick):
+                        time.sleep(self.check_interval)
+                        continue
+
+                    self._last_signal_bar = bar_time
+                    self.open_order(signal, df)
 
                 except KeyboardInterrupt:
                     raise
