@@ -1,7 +1,7 @@
 """
 Скальпинг-бот XAUUSD для MetaTrader 5.
 
-Стратегия: пробой закрытой свечи + EMA + ATR-стопы.
+Стратегия: пробой + EMA 8/21 + RSI + тренд M15 + ATR и трейлинг.
 Перед запуском должен быть открыт терминал MT5 и выполнен вход в счёт.
 """
 
@@ -66,16 +66,46 @@ def calc_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) 
     return atr
 
 
+def calc_rsi(closes: np.ndarray, period: int) -> np.ndarray:
+    """RSI Уайлдера — фильтр, как в типичных советниках."""
+    n = closes.size
+    rsi = np.full(n, 50.0, dtype=np.float64)
+    if n < period + 1:
+        return rsi
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0.0, deltas, 0.0)
+    losses = np.where(deltas < 0.0, -deltas, 0.0)
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+    rsi[period] = 100.0 if avg_loss == 0.0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    for i in range(period, n - 1):
+        avg_gain = (avg_gain * (period - 1) + float(gains[i])) / period
+        avg_loss = (avg_loss * (period - 1) + float(losses[i])) / period
+        if avg_loss == 0.0:
+            rsi[i + 1] = 100.0
+        else:
+            rsi[i + 1] = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    rsi[:period] = rsi[period]
+    return rsi
+
+
 class GoldBot:
     """Торговый бот по золоту: подключение к MT5, сигналы и рыночные ордера."""
 
     def __init__(self) -> None:
         self.symbol = config.SYMBOL
         self.timeframe_name = config.TIMEFRAME
+        self.trend_tf_name = config.TREND_TIMEFRAME
         self.lot = float(config.LOT)
         self.tp_points = int(config.TP_POINTS)
         self.sl_points = int(config.SL_POINTS)
-        self.ema_period = int(config.EMA_PERIOD)
+        self.ema_fast_period = int(config.EMA_FAST)
+        self.ema_slow_period = int(config.EMA_SLOW)
+        self.rsi_period = int(config.RSI_PERIOD)
+        self.rsi_buy_min = float(config.RSI_BUY_MIN)
+        self.rsi_buy_max = float(config.RSI_BUY_MAX)
+        self.rsi_sell_min = float(config.RSI_SELL_MIN)
+        self.rsi_sell_max = float(config.RSI_SELL_MAX)
         self.lookback = int(config.LOOKBACK_BARS)
         self.check_interval = int(config.CHECK_INTERVAL)
         self.magic = int(config.MAGIC_NUMBER)
@@ -87,7 +117,12 @@ class GoldBot:
         self.atr_sl_mult = float(config.ATR_SL_MULT)
         self.atr_tp_mult = float(config.ATR_TP_MULT)
         self.min_body_points = int(config.MIN_CANDLE_BODY_POINTS)
-        self.cooldown_sec = int(config.COOLDOWN_AFTER_TRADE_SEC)
+        self.cooldown_loss_sec = int(config.COOLDOWN_AFTER_LOSS_SEC)
+        self.cooldown_win_sec = int(config.COOLDOWN_AFTER_WIN_SEC)
+        self.trail_be_points = int(config.TRAIL_BE_POINTS)
+        self.trail_start_points = int(config.TRAIL_START_POINTS)
+        self.trail_step_points = int(config.TRAIL_STEP_POINTS)
+        self.learn_deals = int(config.LEARN_DEALS)
         self._connected = False
         self._last_signal_bar: Optional[pd.Timestamp] = None
 
@@ -201,6 +236,13 @@ class GoldBot:
             )
             mt5.shutdown()
             return False
+        if self.trend_tf_name not in TIMEFRAME_MAP:
+            print(
+                f"[ОШИБКА] Неизвестный TREND_TIMEFRAME={self.trend_tf_name!r}. "
+                f"Допустимо: {', '.join(TIMEFRAME_MAP)}"
+            )
+            mt5.shutdown()
+            return False
 
         resolved = self._resolve_symbol()
         if resolved is None:
@@ -241,7 +283,9 @@ class GoldBot:
         df = pd.DataFrame(rates)
         df["time"] = pd.to_datetime(df["time"], unit="s")
         closes = df["close"].to_numpy(dtype=np.float64)
-        df["ema"] = calc_ema(closes, self.ema_period)
+        df["ema_fast"] = calc_ema(closes, self.ema_fast_period)
+        df["ema_slow"] = calc_ema(closes, self.ema_slow_period)
+        df["rsi"] = calc_rsi(closes, self.rsi_period)
         df["atr"] = calc_atr(
             df["high"].to_numpy(dtype=np.float64),
             df["low"].to_numpy(dtype=np.float64),
@@ -250,24 +294,37 @@ class GoldBot:
         )
         return df
 
+    def m15_trend(self) -> Optional[str]:
+        """Направление старшего ТФ: BUY если EMA8 > EMA21 на закрытой свече."""
+        tf = TIMEFRAME_MAP[self.trend_tf_name]
+        rates = mt5.copy_rates_from_pos(self.symbol, tf, 0, 80)
+        if rates is None or len(rates) < 30:
+            return None
+        closes = pd.DataFrame(rates)["close"].to_numpy(dtype=np.float64)
+        fast = calc_ema(closes, self.ema_fast_period)
+        slow = calc_ema(closes, self.ema_slow_period)
+        if fast[-2] > slow[-2]:
+            return "BUY"
+        if fast[-2] < slow[-2]:
+            return "SELL"
+        return None
+
     def check_signal(self, df: pd.DataFrame) -> Optional[str]:
         """
-        Сигнал только по ПОСЛЕДНЕЙ ЗАКРЫТОЙ свече (не по текущей формирующейся).
-        BUY: пробой максимума, закрытие выше EMA, EMA растёт, бычья свеча.
-        SELL: пробой минимума, закрытие ниже EMA, EMA падает, медвежья свеча.
+        Закрытая свеча: пробой + быстрая EMA над/под медленной + RSI + тренд M15.
         """
-        # -1 — текущая незакрытая, -2 — последняя закрытая
-        need = self.lookback + self.atr_period + 3
+        need = self.lookback + max(self.atr_period, self.rsi_period, self.ema_slow_period) + 3
         if df is None or len(df) < need:
             print(f"[ОШИБКА] Мало свечей для сигнала: нужно минимум {need}")
             return None
 
         signal_bar = df.iloc[-2]
         prev = df.iloc[-(self.lookback + 2) : -2]
-        ema_now = float(signal_bar["ema"])
-        ema_prev = float(df.iloc[-3]["ema"])
         close = float(signal_bar["close"])
         open_ = float(signal_bar["open"])
+        ema_fast = float(signal_bar["ema_fast"])
+        ema_slow = float(signal_bar["ema_slow"])
+        rsi = float(signal_bar["rsi"])
         body = abs(close - open_)
         info = mt5.symbol_info(self.symbol)
         point = float(info.point) if info is not None else 0.01
@@ -278,12 +335,28 @@ class GoldBot:
 
         high_max = float(prev["high"].max())
         low_min = float(prev["low"].min())
-        ema_up = ema_now > ema_prev
-        ema_down = ema_now < ema_prev
+        trend = self.m15_trend()
+        blocked = self.learned_block_direction()
 
-        if close > high_max and close > ema_now and ema_up and close > open_:
+        buy_ok = (
+            close > high_max
+            and close > open_
+            and ema_fast > ema_slow
+            and self.rsi_buy_min <= rsi <= self.rsi_buy_max
+            and trend == "BUY"
+            and blocked != "BUY"
+        )
+        sell_ok = (
+            close < low_min
+            and close < open_
+            and ema_fast < ema_slow
+            and self.rsi_sell_min <= rsi <= self.rsi_sell_max
+            and trend == "SELL"
+            and blocked != "SELL"
+        )
+        if buy_ok:
             return "BUY"
-        if close < low_min and close < ema_now and ema_down and close < open_:
+        if sell_ok:
             return "SELL"
         return None
 
@@ -307,12 +380,11 @@ class GoldBot:
             return True
         return False
 
-    def in_cooldown(self) -> bool:
-        """Пауза после закрытия позиции, чтобы не ловить серию стопов подряд."""
+    def _closed_deals(self) -> list:
         now = int(time.time())
-        deals = mt5.history_deals_get(now - 24 * 3600, now)
+        deals = mt5.history_deals_get(now - 7 * 24 * 3600, now)
         if deals is None:
-            return False
+            return []
         closed = [
             d
             for d in deals
@@ -320,14 +392,46 @@ class GoldBot:
             and d.symbol == self.symbol
             and d.entry == mt5.DEAL_ENTRY_OUT
         ]
+        closed.sort(key=lambda d: d.time)
+        return closed
+
+    def learned_block_direction(self) -> Optional[str]:
+        """Если два последних убытка в одну сторону — не повторяем этот вход."""
+        closed = self._closed_deals()
+        if len(closed) < 2:
+            return None
+        last_two = closed[-2:]
+        if last_two[0].profit >= 0 or last_two[1].profit >= 0:
+            return None
+        types = {int(d.type) for d in last_two}
+        if types == {mt5.DEAL_TYPE_SELL}:
+            print("[ОБУЧЕНИЕ] Два убыточных BUY подряд — следующий BUY пропускаем")
+            return "BUY"
+        if types == {mt5.DEAL_TYPE_BUY}:
+            print("[ОБУЧЕНИЕ] Два убыточных SELL подряд — следующий SELL пропускаем")
+            return "SELL"
+        return None
+
+    def adaptive_sl_mult(self) -> float:
+        """После серии стопов чуть шире стоп; после профитов — к базовому значению."""
+        closed = self._closed_deals()[-self.learn_deals :]
+        if not closed:
+            return self.atr_sl_mult
+        losses = sum(1 for d in closed if d.profit < 0)
+        extra = 0.2 * losses
+        return min(self.atr_sl_mult + extra, 2.8)
+
+    def in_cooldown(self) -> bool:
+        """После профита почти сразу; после стопа — короткая пауза 15с."""
+        closed = self._closed_deals()
         if not closed:
             return False
-        last = max(closed, key=lambda d: d.time)
-        elapsed = now - int(last.time)
-        if elapsed < self.cooldown_sec:
-            left = self.cooldown_sec - elapsed
+        last = closed[-1]
+        elapsed = int(time.time()) - int(last.time)
+        wait = self.cooldown_win_sec if last.profit >= 0 else self.cooldown_loss_sec
+        if elapsed < wait:
             print(
-                f"[ПРОПУСК] Пауза после сделки ({elapsed}с), осталось {left}с. "
+                f"[ПРОПУСК] Пауза {wait}с после сделки ({elapsed}с), "
                 f"profit={last.profit:.2f}"
             )
             return True
@@ -362,6 +466,70 @@ class GoldBot:
             return False
         return any(pos.magic == self.magic for pos in positions)
 
+    def _bot_positions(self):
+        positions = mt5.positions_get(symbol=self.symbol)
+        if positions is None:
+            return []
+        return [p for p in positions if p.magic == self.magic]
+
+    def manage_trailing(self) -> None:
+        """Безубыток и трейлинг SL — типичная логика скальперских EA."""
+        info = mt5.symbol_info(self.symbol)
+        tick = mt5.symbol_info_tick(self.symbol)
+        if info is None or tick is None:
+            return
+        point = float(info.point)
+        digits = int(info.digits)
+        min_dist = self._min_stop_distance(info, tick)
+        be_trigger = self.trail_be_points * point
+        trail_start = self.trail_start_points * point
+        trail_step = self.trail_step_points * point
+        bid = float(tick.bid)
+        ask = float(tick.ask)
+
+        for pos in self._bot_positions():
+            new_sl = float(pos.sl) if pos.sl else 0.0
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                profit = bid - float(pos.price_open)
+                if profit >= be_trigger:
+                    be_sl = round(float(pos.price_open) + min_dist, digits)
+                    if be_sl > new_sl:
+                        new_sl = be_sl
+                if profit >= trail_start:
+                    trail_sl = round(bid - trail_step, digits)
+                    if trail_sl > new_sl:
+                        new_sl = trail_sl
+            elif pos.type == mt5.POSITION_TYPE_SELL:
+                profit = float(pos.price_open) - ask
+                if profit >= be_trigger:
+                    be_sl = round(float(pos.price_open) - min_dist, digits)
+                    if new_sl == 0.0 or be_sl < new_sl:
+                        new_sl = be_sl
+                if profit >= trail_start:
+                    trail_sl = round(ask + trail_step, digits)
+                    if new_sl == 0.0 or trail_sl < new_sl:
+                        new_sl = trail_sl
+            else:
+                continue
+
+            old_sl = round(float(pos.sl), digits) if pos.sl else 0.0
+            new_sl = round(new_sl, digits)
+            if new_sl == 0.0 or new_sl == old_sl:
+                continue
+            result = mt5.order_send(
+                {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "symbol": self.symbol,
+                    "position": pos.ticket,
+                    "sl": new_sl,
+                    "tp": float(pos.tp),
+                }
+            )
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"[ТРЕЙЛ] ticket={pos.ticket} SL {old_sl} → {new_sl} profit_dist={profit:.{digits}f}")
+            elif result is not None:
+                print(f"[ТРЕЙЛ] не обновлён retcode={result.retcode} {result.comment}")
+
     def _min_stop_distance(self, info: mt5.SymbolInfo, tick: mt5.Tick) -> float:
         """Минимальный отступ SL/TP: брокер + спред + запас (иначе 10016 Invalid stops)."""
         point = float(info.point)
@@ -383,11 +551,13 @@ class GoldBot:
         volume = self._normalize_volume(info, self.lot)
         min_dist = self._min_stop_distance(info, tick)
         atr = float(df["atr"].iloc[-2]) if len(df) >= 2 else 0.0
-        sl_dist = max(self.sl_points * point, atr * self.atr_sl_mult, min_dist)
+        sl_mult = self.adaptive_sl_mult()
+        sl_dist = max(self.sl_points * point, atr * sl_mult, min_dist)
         tp_dist = max(self.tp_points * point, atr * self.atr_tp_mult, sl_dist * 1.6)
         print(
-            f"[УРОВНИ] ATR={atr:.{digits}f} sl_dist={sl_dist:.{digits}f} "
-            f"tp_dist={tp_dist:.{digits}f} (риск/прибыль ~ {tp_dist / sl_dist:.2f})"
+            f"[УРОВНИ] ATR={atr:.{digits}f} sl_mult={sl_mult:.2f} "
+            f"sl_dist={sl_dist:.{digits}f} tp_dist={tp_dist:.{digits}f} "
+            f"(риск/прибыль ~ {tp_dist / sl_dist:.2f})"
         )
 
         bid = float(tick.bid)
@@ -452,9 +622,9 @@ class GoldBot:
             sys.exit(1)
 
         print(
-            f"[СТАРТ] Цикл {self.check_interval}с | {self.symbol} {self.timeframe_name} | "
-            f"lot={self.lot} minSL={self.sl_points} minTP={self.tp_points} "
-            f"EMA={self.ema_period} ATR x{self.atr_sl_mult}/{self.atr_tp_mult}"
+            f"[СТАРТ] {self.symbol} {self.timeframe_name}+{self.trend_tf_name} | "
+            f"EMA {self.ema_fast_period}/{self.ema_slow_period} RSI={self.rsi_period} | "
+            f"пауза после стопа {self.cooldown_loss_sec}с"
         )
         print("Остановка: Ctrl+C")
 
@@ -466,9 +636,8 @@ class GoldBot:
                     if self.has_open_position():
                         tick = mt5.symbol_info_tick(self.symbol)
                         price_txt = f"bid={tick.bid} ask={tick.ask}" if tick else "нет тика"
-                        print(
-                            f"[{now}] {price_txt} | позиция уже открыта, сигнал не ищем"
-                        )
+                        print(f"[{now}] {price_txt} | позиция открыта, ведём трейлинг")
+                        self.manage_trailing()
                         time.sleep(self.check_interval)
                         continue
 
