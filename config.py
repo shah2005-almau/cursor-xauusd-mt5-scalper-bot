@@ -67,7 +67,7 @@ MAX_HOLD_BARS = 15
 # the bot's realised P/L for the broker day reaches this loss, it opens no new
 # positions until the next broker day.  Zero disables the breaker.
 MAX_DAILY_LOSS = 20.0
-MAX_TRADES_PER_DAY = 6
+MAX_TRADES_PER_DAY = 30
 MAX_CONSECUTIVE_LOSSES = 3
 
 # Учимся по последним закрытым сделкам бота
