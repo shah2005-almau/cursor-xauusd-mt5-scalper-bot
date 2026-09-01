@@ -20,8 +20,12 @@ SESSION_END_HOUR = 21
 LOT = 0.01
 
 # Минимальные SL/TP в пунктах (1 пункт GOLD = 0.01)
-SL_POINTS = 100
-TP_POINTS = 160
+SL_POINTS = 80
+TP_POINTS = 240
+
+# Required minimum reward/risk ratio.  The bot recalculates TP from the actual
+# SL distance, including ATR and broker minimum-stop requirements.
+MIN_RISK_REWARD = 3.0
 
 STOPS_BUFFER_POINTS = 20
 MAX_SPREAD_POINTS = 40

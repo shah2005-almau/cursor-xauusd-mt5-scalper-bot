@@ -147,6 +147,7 @@ class GoldBot:
         self.lot = float(config.LOT)
         self.tp_points = int(config.TP_POINTS)
         self.sl_points = int(config.SL_POINTS)
+        self.min_risk_reward = float(config.MIN_RISK_REWARD)
         self.ema_fast_period = int(config.EMA_FAST)
         self.ema_slow_period = int(config.EMA_SLOW)
         self.rsi_period = int(config.RSI_PERIOD)
@@ -303,6 +304,10 @@ class GoldBot:
             return False
         if self.strategy_mode not in {"BREAKOUT", "PULLBACK", "BOTH"}:
             print("[ОШИБКА] STRATEGY_MODE: BREAKOUT, PULLBACK или BOTH")
+            mt5.shutdown()
+            return False
+        if self.min_risk_reward < 1.0:
+            print("[ОШИБКА] MIN_RISK_REWARD должен быть не меньше 1.0")
             mt5.shutdown()
             return False
         if not (0 <= self.session_start_hour <= 23 and 0 <= self.session_end_hour <= 23):
@@ -736,7 +741,11 @@ class GoldBot:
         atr = float(df["atr"].iloc[-2]) if len(df) >= 2 else 0.0
         sl_mult = self.adaptive_sl_mult()
         sl_dist = max(self.sl_points * point, atr * sl_mult, min_dist)
-        tp_dist = max(self.tp_points * point, atr * self.atr_tp_mult, sl_dist * 1.6)
+        tp_dist = max(
+            self.tp_points * point,
+            atr * self.atr_tp_mult,
+            sl_dist * self.min_risk_reward,
+        )
         print(
             f"[УРОВНИ] ATR={atr:.{digits}f} sl_mult={sl_mult:.2f} "
             f"sl_dist={sl_dist:.{digits}f} tp_dist={tp_dist:.{digits}f} "
