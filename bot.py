@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 
 import MetaTrader5 as mt5
@@ -27,6 +27,11 @@ TIMEFRAME_MAP: dict[str, int] = {
     "H1": mt5.TIMEFRAME_H1,
     "H4": mt5.TIMEFRAME_H4,
     "D1": mt5.TIMEFRAME_D1,
+}
+
+TIMEFRAME_SECONDS: dict[str, int] = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "D1": 86400,
 }
 
 
@@ -89,6 +94,49 @@ def calc_rsi(closes: np.ndarray, period: int) -> np.ndarray:
     return rsi
 
 
+def calc_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+    """Wilder ADX: trend-strength filter, independent of trend direction."""
+    n = close.size
+    adx = np.zeros(n, dtype=np.float64)
+    if n < period + 2:
+        return adx
+
+    tr = np.zeros(n, dtype=np.float64)
+    plus_dm = np.zeros(n, dtype=np.float64)
+    minus_dm = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        up = float(high[i] - high[i - 1])
+        down = float(low[i - 1] - low[i])
+        plus_dm[i] = up if up > down and up > 0.0 else 0.0
+        minus_dm[i] = down if down > up and down > 0.0 else 0.0
+        tr[i] = max(float(high[i] - low[i]), abs(float(high[i] - close[i - 1])), abs(float(low[i] - close[i - 1])))
+
+    atr = np.zeros(n, dtype=np.float64)
+    smooth_plus = np.zeros(n, dtype=np.float64)
+    smooth_minus = np.zeros(n, dtype=np.float64)
+    atr[period] = float(np.mean(tr[1 : period + 1]))
+    smooth_plus[period] = float(np.mean(plus_dm[1 : period + 1]))
+    smooth_minus[period] = float(np.mean(minus_dm[1 : period + 1]))
+    dx = np.zeros(n, dtype=np.float64)
+    for i in range(period, n):
+        if i > period:
+            atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+            smooth_plus[i] = (smooth_plus[i - 1] * (period - 1) + plus_dm[i]) / period
+            smooth_minus[i] = (smooth_minus[i - 1] * (period - 1) + minus_dm[i]) / period
+        if atr[i] > 0.0:
+            plus_di = 100.0 * smooth_plus[i] / atr[i]
+            minus_di = 100.0 * smooth_minus[i] / atr[i]
+            total = plus_di + minus_di
+            dx[i] = 100.0 * abs(plus_di - minus_di) / total if total > 0.0 else 0.0
+    start = period * 2 - 1
+    if start < n:
+        adx[start] = float(np.mean(dx[period : start + 1]))
+        for i in range(start + 1, n):
+            adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+        adx[:start] = adx[start]
+    return adx
+
+
 class GoldBot:
     """Торговый бот по золоту: подключение к MT5, сигналы и рыночные ордера."""
 
@@ -116,6 +164,13 @@ class GoldBot:
         self.atr_period = int(config.ATR_PERIOD)
         self.atr_sl_mult = float(config.ATR_SL_MULT)
         self.atr_tp_mult = float(config.ATR_TP_MULT)
+        self.adx_period = int(config.ADX_PERIOD)
+        self.min_adx = float(config.MIN_ADX)
+        self.strategy_mode = str(config.STRATEGY_MODE).upper()
+        self.session_start_hour = int(config.SESSION_START_HOUR)
+        self.session_end_hour = int(config.SESSION_END_HOUR)
+        self.max_hold_bars = int(config.MAX_HOLD_BARS)
+        self.max_daily_loss = float(config.MAX_DAILY_LOSS)
         self.min_body_points = int(config.MIN_CANDLE_BODY_POINTS)
         self.cooldown_loss_sec = int(config.COOLDOWN_AFTER_LOSS_SEC)
         self.cooldown_win_sec = int(config.COOLDOWN_AFTER_WIN_SEC)
@@ -243,6 +298,14 @@ class GoldBot:
             )
             mt5.shutdown()
             return False
+        if self.strategy_mode not in {"BREAKOUT", "PULLBACK", "BOTH"}:
+            print("[ОШИБКА] STRATEGY_MODE: BREAKOUT, PULLBACK или BOTH")
+            mt5.shutdown()
+            return False
+        if not (0 <= self.session_start_hour <= 23 and 0 <= self.session_end_hour <= 23):
+            print("[ОШИБКА] SESSION_START_HOUR и SESSION_END_HOUR должны быть в диапазоне 0..23")
+            mt5.shutdown()
+            return False
 
         resolved = self._resolve_symbol()
         if resolved is None:
@@ -292,6 +355,12 @@ class GoldBot:
             closes,
             self.atr_period,
         )
+        df["adx"] = calc_adx(
+            df["high"].to_numpy(dtype=np.float64),
+            df["low"].to_numpy(dtype=np.float64),
+            closes,
+            self.adx_period,
+        )
         return df
 
     def m15_trend(self) -> Optional[str]:
@@ -309,7 +378,16 @@ class GoldBot:
             return "SELL"
         return None
 
-    def check_signal(self, df: pd.DataFrame) -> Optional[str]:
+    def in_trading_session(self) -> bool:
+        """Return whether current UTC time is inside the configured session."""
+        hour = datetime.now(UTC).hour
+        if self.session_start_hour == self.session_end_hour:
+            return True
+        if self.session_start_hour < self.session_end_hour:
+            return self.session_start_hour <= hour < self.session_end_hour
+        return hour >= self.session_start_hour or hour < self.session_end_hour
+
+    def check_signal(self, df: pd.DataFrame) -> Optional[tuple[str, str]]:
         """
         Закрытая свеча: пробой + быстрая EMA над/под медленной + RSI + тренд M15.
         """
@@ -325,12 +403,13 @@ class GoldBot:
         ema_fast = float(signal_bar["ema_fast"])
         ema_slow = float(signal_bar["ema_slow"])
         rsi = float(signal_bar["rsi"])
+        adx = float(signal_bar["adx"])
         body = abs(close - open_)
         info = mt5.symbol_info(self.symbol)
         point = float(info.point) if info is not None else 0.01
         min_body = self.min_body_points * point
 
-        if body < min_body:
+        if body < min_body or adx < self.min_adx:
             return None
 
         high_max = float(prev["high"].max())
@@ -354,11 +433,50 @@ class GoldBot:
             and trend == "SELL"
             and blocked != "SELL"
         )
-        if buy_ok:
-            return "BUY"
-        if sell_ok:
-            return "SELL"
+        if self.strategy_mode in ("BREAKOUT", "BOTH"):
+            if buy_ok:
+                return "BUY", "breakout"
+            if sell_ok:
+                return "SELL", "breakout"
+
+        # Pullback continuation: a completed candle retests the fast EMA and
+        # closes back with the higher-timeframe trend.  This avoids chasing a
+        # breakout and is evaluated only after the candle is final.
+        pullback_buy = (
+            float(signal_bar["low"]) <= ema_fast <= close
+            and close > open_ and ema_fast > ema_slow
+            and 45.0 <= rsi <= 65.0 and trend == "BUY" and blocked != "BUY"
+        )
+        pullback_sell = (
+            float(signal_bar["high"]) >= ema_fast >= close
+            and close < open_ and ema_fast < ema_slow
+            and 35.0 <= rsi <= 55.0 and trend == "SELL" and blocked != "SELL"
+        )
+        if self.strategy_mode in ("PULLBACK", "BOTH"):
+            if pullback_buy:
+                return "BUY", "pullback"
+            if pullback_sell:
+                return "SELL", "pullback"
         return None
+
+    def daily_loss_limit_hit(self) -> bool:
+        """Protect the account by stopping new entries after the daily loss cap."""
+        if self.max_daily_loss <= 0.0:
+            return False
+        now = datetime.now(UTC)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = mt5.history_deals_get(day_start, now)
+        if deals is None:
+            return True  # Never trade blind if history is unavailable.
+        realised = sum(
+            float(d.profit) + float(d.commission) + float(d.swap)
+            for d in deals
+            if d.magic == self.magic and d.symbol == self.symbol and d.entry == mt5.DEAL_ENTRY_OUT
+        )
+        if realised <= -self.max_daily_loss:
+            print(f"[RISK] Daily realised P/L={realised:.2f}; loss cap={self.max_daily_loss:.2f}")
+            return True
+        return False
 
     def _closed_bar_time(self, df: pd.DataFrame) -> Optional[pd.Timestamp]:
         if df is None or len(df) < 2:
@@ -530,6 +648,41 @@ class GoldBot:
             elif result is not None:
                 print(f"[ТРЕЙЛ] не обновлён retcode={result.retcode} {result.comment}")
 
+    def close_expired_positions(self) -> None:
+        """Close bot positions that outlive the configured scalping time limit."""
+        if self.max_hold_bars <= 0:
+            return
+        max_age = self.max_hold_bars * TIMEFRAME_SECONDS[self.timeframe_name]
+        info = mt5.symbol_info(self.symbol)
+        tick = mt5.symbol_info_tick(self.symbol)
+        if info is None or tick is None:
+            return
+        for pos in self._bot_positions():
+            age = int(time.time()) - int(pos.time)
+            if age < max_age:
+                continue
+            is_buy = pos.type == mt5.POSITION_TYPE_BUY
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "position": pos.ticket,
+                "volume": float(pos.volume),
+                "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+                "price": float(tick.bid) if is_buy else float(tick.ask),
+                "deviation": self.deviation,
+                "magic": self.magic,
+                "comment": "GoldBot time exit",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": self._filling_type(info),
+            }
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"[TIME EXIT] ticket={pos.ticket} age={age}s limit={max_age}s")
+            elif result is None:
+                print(f"[TIME EXIT] failed: {mt5.last_error()}")
+            else:
+                print(f"[TIME EXIT] rejected retcode={result.retcode} {result.comment}")
+
     def _min_stop_distance(self, info: mt5.SymbolInfo, tick: mt5.Tick) -> float:
         """Минимальный отступ SL/TP: брокер + спред + запас (иначе 10016 Invalid stops)."""
         point = float(info.point)
@@ -538,7 +691,7 @@ class GoldBot:
         buffer = self.stops_buffer_points * point
         return max(broker_min, spread + buffer, point)
 
-    def open_order(self, direction: str, df: pd.DataFrame) -> bool:
+    def open_order(self, direction: str, df: pd.DataFrame, strategy: str) -> bool:
         """Рыночный ордер BUY по ask / SELL по bid со SL и TP в пунктах."""
         tick = mt5.symbol_info_tick(self.symbol)
         info = mt5.symbol_info(self.symbol)
@@ -594,7 +747,7 @@ class GoldBot:
             "tp": tp,
             "deviation": self.deviation,
             "magic": self.magic,
-            "comment": "GoldBot scalp",
+            "comment": f"GoldBot {strategy}",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._filling_type(info),
         }
@@ -631,17 +784,27 @@ class GoldBot:
         try:
             while True:
                 try:
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
                     if self.has_open_position():
                         tick = mt5.symbol_info_tick(self.symbol)
                         price_txt = f"bid={tick.bid} ask={tick.ask}" if tick else "нет тика"
                         print(f"[{now}] {price_txt} | позиция открыта, ведём трейлинг")
                         self.manage_trailing()
+                        self.close_expired_positions()
                         time.sleep(self.check_interval)
                         continue
 
                     if self.in_cooldown():
+                        time.sleep(self.check_interval)
+                        continue
+
+                    if not self.in_trading_session():
+                        print(f"[{now}] [ПРОПУСК] вне сессии {self.session_start_hour}:00-{self.session_end_hour}:00 UTC")
+                        time.sleep(self.check_interval)
+                        continue
+
+                    if self.daily_loss_limit_hit():
                         time.sleep(self.check_interval)
                         continue
 
@@ -658,9 +821,10 @@ class GoldBot:
                         price_txt = f"close={float(df.iloc[-1]['close']):.5f}"
 
                     signal = self.check_signal(df)
-                    print(f"[{now}] {self.symbol} {price_txt} | сигнал={signal}")
+                    signal_text = f"{signal[0]} ({signal[1]})" if signal else None
+                    print(f"[{now}] {self.symbol} {price_txt} | сигнал={signal_text}")
 
-                    if signal not in ("BUY", "SELL"):
+                    if signal is None:
                         time.sleep(self.check_interval)
                         continue
 
@@ -674,7 +838,7 @@ class GoldBot:
                         continue
 
                     self._last_signal_bar = bar_time
-                    self.open_order(signal, df)
+                    self.open_order(signal[0], df, signal[1])
 
                 except KeyboardInterrupt:
                     raise
