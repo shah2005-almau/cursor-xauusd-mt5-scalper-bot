@@ -13,11 +13,11 @@ STRATEGY_MODE = "BOTH"  # BREAKOUT, PULLBACK, BOTH
 
 # Only trade during the liquid London / New York part of the day.  Hours are
 # UTC, so they are independent of the computer and broker-server time zones.
-SESSION_START_HOUR = 8
-SESSION_END_HOUR = 21
+SESSION_START_HOUR = 7
+SESSION_END_HOUR = 22
 
 # Объём сделки (лоты)
-LOT = 0.01
+LOT = 0.1
 
 # Минимальные SL/TP в пунктах (1 пункт GOLD = 0.01)
 SL_POINTS = 100
@@ -30,7 +30,7 @@ ATR_PERIOD = 14
 ATR_SL_MULT = 1.8
 ATR_TP_MULT = 2.8
 ADX_PERIOD = 14
-MIN_ADX = 20.0
+MIN_ADX = 15.0
 
 # Две EMA, как в большинстве советников по золоту
 EMA_FAST = 8
@@ -43,15 +43,15 @@ RSI_BUY_MAX = 72
 RSI_SELL_MIN = 28
 RSI_SELL_MAX = 52
 
-LOOKBACK_BARS = 12
-MIN_CANDLE_BODY_POINTS = 8
+LOOKBACK_BARS = 8
+MIN_CANDLE_BODY_POINTS = 5
 
-# Do not scalp in an inactive market: the signal candle's tick volume must be
-# at least this multiple of the mean volume of the preceding LOOKBACK_BARS.
-MIN_TICK_VOLUME_RATIO = 1.10
+# Avoid very inactive periods: the signal candle's tick volume must reach this
+# multiple of the mean volume of the preceding LOOKBACK_BARS.
+MIN_TICK_VOLUME_RATIO = 0.85
 
 # Короткая пауза только после убытка (после профита не ждём)
-COOLDOWN_AFTER_LOSS_SEC = 15
+COOLDOWN_AFTER_LOSS_SEC = 5
 COOLDOWN_AFTER_WIN_SEC = 0
 
 # Трейлинг, как в типовых скальперах: безубыток, потом подтягивание SL
